@@ -1,86 +1,61 @@
-# Traefik Docker Setup
+# Traefik
 
-Simple Traefik v3.0 reverse proxy for local development and production.
+Shared edge proxy for the sites on this host. Terminates TLS, obtains
+Let's Encrypt certificates, and routes to app containers by their Docker labels.
 
-## Quick Start
+## Setup
 
-### Development
 ```bash
-cp .env.local .env
-docker compose --profile dev up -d
-# Dashboard: http://localhost:8080/dashboard/
-```
+cp .env.example .env
+# Generate the dashboard hash into TRAEFIK_DASHBOARD_AUTH, with the $ doubled:
+# Compose interpolates .env values, so a single $ is read as a variable
+# reference and the bcrypt hash silently arrives truncated.
+htpasswd -nbB admin 'your-password' | sed 's/[$]/$$/g'
 
-### Production
-```bash
-cp .env.production.example .env
-nano .env
-
-# Set these values:
-# - TRAEFIK_DASHBOARD_HOST=traefik.yourdomain.com
-# - TRAEFIK_LETSENCRYPT_EMAIL=your-email@example.com
-# - TRAEFIK_DASHBOARD_AUTH_USERS=admin:$(htpasswd -nbB admin PASSWORD | cut -d: -f2)
-
-# Ensure DNS points to server and ports 80/443 are open
 docker compose up -d
-# Dashboard: https://traefik.yourdomain.com/dashboard/
 ```
 
-## Configuration
+The stack creates the Docker network `proxy`. Every app stack joins it as an
+external network, so **start Traefik before the app stacks**.
 
-| Environment | TLS | Dashboard | Auth | Logging |
-|-------------|-----|-----------|------|---------|
-| Dev | No | :8080 | None | Debug |
-| Prod | Let's Encrypt | Via routing | BasicAuth | Warn |
-
-## Connect Your Services
-
-Add to your service's `docker-compose.yml`:
-
-```yaml
-services:
-  myapp:
-    image: myapp:latest
-    networks:
-      - traefik-proxy
-    labels:
-      - "traefik.enable=true"
-      - "traefik.http.routers.myapp.rule=Host(`myapp.localhost`)"
-      - "traefik.http.routers.myapp.entrypoints=web"
-      - "traefik.http.services.myapp.loadbalancer.server.port=80"
-
-networks:
-  traefik-proxy:
-    external: true
 ```
 
-**Production with HTTPS:**
-```yaml
-labels:
-  - "traefik.enable=true"
-  - "traefik.http.routers.myapp.rule=Host(`myapp.yourdomain.com`)"
-  - "traefik.http.routers.myapp.entrypoints=websecure"
-  - "traefik.http.routers.myapp.tls.certresolver=letsencrypt"
-  # Optional: HTTP to HTTPS redirect
-  - "traefik.http.routers.myapp-http.rule=Host(`myapp.yourdomain.com`)"
-  - "traefik.http.routers.myapp-http.entrypoints=web"
-  - "traefik.http.routers.myapp-http.middlewares=https-redirect"
-```
+Requirements for a certificate to be issued:
 
-## Custom Middlewares
+- `DOMAIN` in the app's `.env` resolves (A/AAAA) to this host — including the
+  `www.` name, which the app also routes.
+- Ports 80 and 443 reach this host from the internet. The HTTP-01 challenge is
+  answered on port 80, so it cannot be firewalled off.
 
-Available middlewares defined in `docker-compose.yml`:
-- `security-headers` - Security headers (HSTS, frame-deny, XSS filter)
-- `dashboard-auth` - BasicAuth for dashboard
-
-Reference in labels: `traefik.http.routers.myapp.middlewares=security-headers`
-
-## Common Commands
+## Verifying
 
 ```bash
-docker compose --profile dev up -d     # Start with dev profile
-docker compose logs -f                 # View logs
-docker compose down                    # Stop
-docker compose restart                 # Restart
-docker volume rm traefik_letsencrypt-data  # Delete certificates (when stopped)
+docker compose logs -f traefik            # watch ACME + router setup
+docker compose exec traefik traefik healthcheck --ping
+curl -I http://<your-domain>              # expect 301 to https
+curl -I https://<your-domain>
 ```
+
+Dashboard: `https://$TRAEFIK_DOMAIN` (basic auth). It is never exposed via
+`api.insecure`, so there is no unauthenticated port to forget about.
+
+## Notes
+
+- **Test with the staging CA first.** Uncomment `ACME_CA_SERVER` in `.env`;
+  Let's Encrypt allows only 5 duplicate certificates per week and a
+  misconfigured DNS record burns through that quickly. Delete
+  `letsencrypt/acme.json` before switching back to production, otherwise the
+  staging certificates are reused.
+- Certificates live in `letsencrypt/acme.json` (created 0600 by Traefik). Back
+  it up, or renewal starts from scratch after a host rebuild.
+- Access logs go to `logs/access.log` and are **not** rotated by Traefik. Add a
+  logrotate entry with `copytruncate` if this host serves real traffic.
+- The Docker socket is mounted read-only. Anything that can read it can enumerate
+  containers, so keep the dashboard behind its basic auth.
+- TLS floor is 1.2 with forward-secret AEAD ciphers only
+  (`config/dynamic/tls.yaml`, hot-reloaded — no restart needed).
+- `docker compose config` prints the hash with $$ still doubled — that is its
+  YAML round-trip escaping, not a bug. To see what the container really got:
+  `docker inspect traefik --format '{{index .Config.Labels "traefik.http.middlewares.dashboard-auth.basicauth.users"}}'`
+- App-specific middlewares (compression, www redirect, form rate limits) are
+  declared on the app's own labels, not here. This stack stays app-agnostic.

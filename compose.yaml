@@ -1,97 +1,111 @@
-# ============================================
-# TRAEFIK DOCKER COMPOSE
-# Minimal production setup with Let's Encrypt
-# ============================================
+# Reverse proxy for all sites on this host.
+#
+# Start:  docker compose up -d          (creates the shared `proxy` network)
+# Logs:   docker compose logs -f
+# Stop:   docker compose down           (app stacks lose their entrypoint)
+#
+# This stack OWNS the `proxy` network. Start it before any app stack that
+# declares `proxy` as external
+#
+# Static configuration lives in `command:` rather than a traefik.yaml, because
+# Traefik does not expand ${VARS} inside its static config file — flags do get
+# Compose interpolation, so .env stays the single place to configure this stack.
+# Dynamic configuration (TLS options) is a watched file in ./config/dynamic.
 
 services:
   traefik:
-    image: traefik:v3.5
+    image: traefik:v3.7.13
     container_name: traefik
     restart: unless-stopped
     security_opt:
       - no-new-privileges:true
-    ports:
-      - "80:80"
-      - "443:443"
-      - "${TRAEFIK_DASHBOARD_PORT}:8080"
     command:
-      # Global settings
-      - "--global.sendanonymoususage=false"
-      - "--global.checknewversion=false"
+      - --global.checknewversion=false
+      - --global.sendanonymoususage=false
+      - --log.level=${TRAEFIK_LOG_LEVEL:-INFO}
+      - --accesslog=true
+      - --accesslog.filepath=/var/log/traefik/access.log
+      - --ping=true
 
-      # API and Dashboard
-      - "--api=true"
-      - "--api.dashboard=true"
+      # --- Entrypoints (names must match the app stacks' router labels) ---
+      - --entrypoints.web.address=:80
+      - --entrypoints.websecure.address=:443
+      - --entrypoints.websecure.http3=true
+      # Trust no client-supplied X-Forwarded-* headers: this is the edge.
+      - --entrypoints.web.forwardedheaders.insecure=false
+      - --entrypoints.websecure.forwardedheaders.insecure=false
+      # Cap request duration so a slowloris client can't pin a connection open.
+      - --entrypoints.web.transport.respondingtimeouts.readtimeout=60s
+      - --entrypoints.websecure.transport.respondingtimeouts.readtimeout=60s
 
-      # EntryPoints
-      - "--entrypoints.web.address=:80"
-      - "--entrypoints.websecure.address=:443"
+      # --- Providers ---
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --providers.docker.network=proxy
+      - --providers.file.directory=/etc/traefik/dynamic
+      - --providers.file.watch=true
 
-      # Docker Provider
-      - "--providers.docker=true"
-      - "--providers.docker.exposedbydefault=false"
-      - "--providers.docker.endpoint=unix:///var/run/docker.sock"
-      - "--providers.docker.network=traefik-proxy"
+      # --- ACME / Let's Encrypt (resolver name is referenced by app labels) ---
+      # HTTP-01 challenge: needs port 80 reachable from the internet for every
+      # domain that requests a certificate.
+      - --certificatesresolvers.letsencrypt.acme.email=${ACME_EMAIL:?missing ACME_EMAIL}
+      - --certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json
+      - --certificatesresolvers.letsencrypt.acme.httpchallenge=true
+      - --certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web
+      - --certificatesresolvers.letsencrypt.acme.caserver=${ACME_CA_SERVER:-https://acme-v02.api.letsencrypt.org/directory}
 
-      # Let's Encrypt (HTTP Challenge)
-      - "--certificatesresolvers.letsencrypt.acme.email=${TRAEFIK_ACME_EMAIL}"
-      - "--certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json"
-      - "--certificatesresolvers.letsencrypt.acme.httpchallenge=true"
-      - "--certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web"
-
-      # Logging
-      - "--log.level=${TRAEFIK_LOG_LEVEL:-WARN}"
-      - "--accesslog=true"
-      - "--accesslog.filepath=/logs/access.log"
-
-    environment:
-      - TZ=${TZ:-Europe/Berlin}
-
+      # --- Dashboard (routed below, never via api.insecure) ---
+      - --api.dashboard=true
+    ports:
+      - '80:80'
+      - '443:443'
+      - '443:443/udp' # HTTP/3
     volumes:
-      - ./logs:/logs
+      # Read-only socket: Traefik only needs to discover containers and their labels.
       - /var/run/docker.sock:/var/run/docker.sock:ro
-      - letsencrypt-data:/letsencrypt
-
+      - ./config/dynamic:/etc/traefik/dynamic:ro
+      # Traefik creates acme.json here with 0600 on first run.
+      - ./letsencrypt:/letsencrypt
+      - ./logs:/var/log/traefik
+    environment:
+      TZ: ${TZ:-Europe/Berlin}
+    healthcheck:
+      test: ['CMD', 'traefik', 'healthcheck', '--ping']
+      start_period: 10s
+      interval: 15s
+      timeout: 5s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+        reservations:
+          memory: 64M
     labels:
-      - "traefik.enable=true"
+      - traefik.enable=true
+      - traefik.docker.network=proxy
 
-      # Dashboard HTTPS router
-      - "traefik.http.routers.traefik-dashboard.rule=Host(`${TRAEFIK_DASHBOARD_HOST}`)"
-      - "traefik.http.routers.traefik-dashboard.entrypoints=${TRAEFIK_DASHBOARD_ENTRYPOINT:-websecure}"
-      - "traefik.http.routers.traefik-dashboard.service=api@internal"
-      - "traefik.http.routers.traefik-dashboard.tls=${TRAEFIK_TLS_ENABLED:-true}"
-      - "traefik.http.routers.traefik-dashboard.tls.certresolver=${TRAEFIK_CERT_RESOLVER:-letsencrypt}"
-      - "traefik.http.routers.traefik-dashboard.middlewares=${TRAEFIK_DASHBOARD_MIDDLEWARES:-}"
+      # Dashboard — HTTPS only, behind basic auth. Point TRAEFIK_DOMAIN at this
+      # host (A record); the default never matches a public request.
+      - traefik.http.routers.traefik-dashboard.rule=Host(`${TRAEFIK_DOMAIN:-traefik.localhost}`)
+      - traefik.http.routers.traefik-dashboard.entrypoints=websecure
+      - traefik.http.routers.traefik-dashboard.tls.certresolver=letsencrypt
+      - traefik.http.routers.traefik-dashboard.service=api@internal
+      - traefik.http.routers.traefik-dashboard.middlewares=dashboard-auth
+      - traefik.http.middlewares.dashboard-auth.basicauth.users=${TRAEFIK_DASHBOARD_AUTH:?missing TRAEFIK_DASHBOARD_AUTH}
 
-      # BasicAuth middleware
-      - "traefik.http.middlewares.dashboard-auth.basicauth.users=${TRAEFIK_DASHBOARD_AUTH_USERS:-}"
-
-      # Security Headers middleware (inline, no config file needed)
-      - "traefik.http.middlewares.security-headers.headers.frameDeny=true"
-      - "traefik.http.middlewares.security-headers.headers.browserXssFilter=true"
-      - "traefik.http.middlewares.security-headers.headers.contentTypeNosniff=true"
-      - "traefik.http.middlewares.security-headers.headers.stsSeconds=31536000"
-      - "traefik.http.middlewares.security-headers.headers.stsIncludeSubdomains=true"
-
+      # Plain HTTP for the dashboard host redirects to HTTPS.
+      - traefik.http.routers.traefik-dashboard-http.rule=Host(`${TRAEFIK_DOMAIN:-traefik.localhost}`)
+      - traefik.http.routers.traefik-dashboard-http.entrypoints=web
+      - traefik.http.routers.traefik-dashboard-http.service=api@internal
+      - traefik.http.routers.traefik-dashboard-http.middlewares=dashboard-https
+      - traefik.http.middlewares.dashboard-https.redirectscheme.scheme=https
+      - traefik.http.middlewares.dashboard-https.redirectscheme.permanent=true
     networks:
       - proxy
-
-  # Example service (only in development)
-  whoami:
-    image: traefik/whoami
-    container_name: whoami
-    profiles:
-      - dev
-    networks:
-      - proxy
-    labels:
-      - "traefik.enable=true"
-      - "traefik.http.routers.whoami.rule=Host(`whoami.localhost`)"
-      - "traefik.http.routers.whoami.entrypoints=web"
 
 networks:
+  # Created by this stack under the literal name `proxy`; app stacks join it
+  # as an external network.
   proxy:
     name: proxy
-
-volumes:
-  letsencrypt-data:
