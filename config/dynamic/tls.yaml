@@ -1,4 +1,4 @@
-# Dynamic configuration — hot-reloaded, no restart needed.
+# Dynamic configuration - hot-reloaded, no restart needed.
 
 tls:
   options:

@@ -1,16 +1,14 @@
 # Reverse proxy for all sites on this host.
 #
-# Start:  docker compose up -d          (creates the shared `proxy` network)
-# Logs:   docker compose logs -f
-# Stop:   docker compose down           (app stacks lose their entrypoint)
-#
-# This stack OWNS the `proxy` network. Start it before any app stack that
-# declares `proxy` as external
+# This stack OWNS the `traefik-proxy` network. Start it before any app stack
+# that declares `traefik-proxy` as external
 #
 # Static configuration lives in `command:` rather than a traefik.yaml, because
-# Traefik does not expand ${VARS} inside its static config file — flags do get
+# Traefik does not expand ${VARS} inside its static config file - flags do get
 # Compose interpolation, so .env stays the single place to configure this stack.
 # Dynamic configuration (TLS options) is a watched file in ./config/dynamic.
+
+name: traefik
 
 services:
   traefik:
@@ -41,7 +39,7 @@ services:
       # --- Providers ---
       - --providers.docker=true
       - --providers.docker.exposedbydefault=false
-      - --providers.docker.network=proxy
+      - --providers.docker.network=traefik-proxy
       - --providers.file.directory=/etc/traefik/dynamic
       - --providers.file.watch=true
 
@@ -83,9 +81,9 @@ services:
           memory: 64M
     labels:
       - traefik.enable=true
-      - traefik.docker.network=proxy
+      - traefik.docker.network=traefik-proxy
 
-      # Dashboard — HTTPS only, behind basic auth. Point TRAEFIK_DOMAIN at this
+      # Dashboard - HTTPS only, behind basic auth. Point TRAEFIK_DOMAIN at this
       # host (A record); the default never matches a public request.
       - traefik.http.routers.traefik-dashboard.rule=Host(`${TRAEFIK_DOMAIN:-traefik.localhost}`)
       - traefik.http.routers.traefik-dashboard.entrypoints=websecure
@@ -102,10 +100,10 @@ services:
       - traefik.http.middlewares.dashboard-https.redirectscheme.scheme=https
       - traefik.http.middlewares.dashboard-https.redirectscheme.permanent=true
     networks:
-      - proxy
+      - traefik-proxy
 
 networks:
-  # Created by this stack under the literal name `proxy`; app stacks join it
-  # as an external network.
-  proxy:
-    name: proxy
+  # Created by this stack under the literal name `traefik-proxy`; app stacks
+  # join it as an external network.
+  traefik-proxy:
+    name: traefik-proxy
